@@ -27,13 +27,20 @@ import pickle
 class Manager(object):
     def __init__(self, args):
         super().__init__()
+        
+        # Add thêm
         self.expert_distribution = [
             {
                 "class_mean": [],
-                "accumulate_cov": torch.zeros(self.query_size, self.query_size),
-                "cov_inv": torch.ones(self.query_size, self.query_size),
+                "accumulate_cov": torch.zeros(args.encoder_output_size * 2, args.encoder_output_size * 2),
+                "cov_inv": torch.ones(args.encoder_output_size * 2, args.encoder_output_size * 2),
             }
         ]
+        self.num_tasks = -1
+        self.base_bert = BaseBert(config=args).to(args.device)
+        self.query_mode = "mahalanobis"
+        # self.tokenizer_for_base_bert = BaseBert.from_pretrained("bert-base-uncased")
+        # Add thêm
 
     def train_classifier(self, args, classifier, swag_classifier, replayed_epochs, name):
         classifier.train()
@@ -265,11 +272,11 @@ class Manager(object):
 
     def statistic(self, args, encoder, train_data, task_id):
         for i in range(-1, task_id + 1):
-            mean, cov, task_mean, task_cov = self.get_mean_and_cov(args, encoder, train_data, i)
+            mean, cov, task_mean, task_cov = self.get_mean_and_cov(args=args, encoder=encoder, dataset=train_data, name="statistic", expert_id=i)
             self.new_statistic(args, mean, cov, task_mean, task_cov, i)
     
     def new_statistic(self, args, mean, cov, task_mean, task_cov, i):
-        expert_id = self.shift_expert_id(expert_id)
+        expert_id = i + 1
         if expert_id == 0 or expert_id == 1:
             length = self.num_tasks + 1
         else:
@@ -289,22 +296,25 @@ class Manager(object):
         labels = []
         
         td = tqdm(data_loader, desc=name)
-
         # testing
-        for step, (label, tokens, _) in enumerate(td):
-            
+        for step, (label, tokens, _) in enumerate(td):            
             tokens = torch.stack([x.to(args.device) for x in tokens], dim=0)
+            if expert_id == -1:
+                prompted_encoder_out = self.base_bert(input_ids=tokens,
+                                            attention_mask= (tokens!=0))
+            elif expert_id == 0:
+                prompted_encoder_out = encoder(tokens)
+            else:
+                # encoder forward
+                encoder_out = encoder(tokens)
+                
+                pool_ids = [expert_id for x in range(len(label))]
 
-            # encoder forward
-            encoder_out = encoder(tokens)
-            
-            pool_ids = [expert_id for x in range(len(label))]
+                # get pools
+                prompt_pools = [self.prompt_pools[x] for x in pool_ids]
 
-            # get pools
-            prompt_pools = [self.prompt_pools[x] for x in pool_ids]
-
-            # prompted encoder forward
-            prompted_encoder_out = encoder(tokens, None, encoder_out["x_encoded"], prompt_pools)
+                # prompted encoder forward
+                prompted_encoder_out = encoder(tokens, None, encoder_out["x_encoded"], prompt_pools)
 
             # prediction
             prelogits.extend(prompted_encoder_out["x_encoded"].tolist())
@@ -335,125 +345,146 @@ class Manager(object):
 
         return mean_over_classes, shared_cov, task_mean, task_cov
 
+    def get_prompt_indices(self, args, prelogits, expert_id=0):
+        expert_id = expert_id + 1
+        task_means_over_classes = self.expert_distribution[expert_id]["class_mean"]
+        cov_inv = self.expert_distribution[expert_id]["cov_inv"]
+        # print("-----------------")
+        # print(task_means_over_classes)
+        # print(cov_inv)
+
+        scores_over_tasks = []
+        class_indices_over_tasks = []
+        # for each task
+        for idx, mean_over_classes in enumerate(task_means_over_classes):
+            num_labels, _ = mean_over_classes.shape
+            score_over_classes = []
+            # for each label in task
+            for c in range(num_labels):
+                if self.query_mode == "cosine":
+                    score = - F.cosine_similarity(prelogits, mean_over_classes[c])
+                elif self.query_mode == "euclidean":
+                    score = torch.cdist(prelogits, mean_over_classes[c].unsqueeze(0)).squeeze(1)
+                elif self.query_mode == "mahalanobis":
+                    # print("pêppeee")
+                    # print(prelogits.shape)
+                    # print(mean_over_classes[c].shape)
+                    # print(cov_inv.shape)
+                    score = mahalanobis(prelogits, mean_over_classes[c], cov_inv, norm=2)
+                    print(score)
+                elif self.query_mode == "maha_ft":
+                    score = mahalanobis(prelogits[idx], mean_over_classes[c], cov_inv, norm=2)
+                else:
+                    print("erorrrrrrrrr")
+                    raise NotImplementedError
+                score_over_classes.append(score)
+                print(score)
+            # [num_labels, n]
+            score_over_classes = torch.stack(score_over_classes)
+            score, class_indices = score_over_classes.min(dim=0)
+            # min score of labels as task score
+            scores_over_tasks.append(score)
+            # class_indices_over_tasks.append(class_indices + idx * num_labels)
+            class_indices_over_tasks.append(class_indices)
+        # [task_num, n]
+        scores_over_tasks = torch.stack(scores_over_tasks, dim=0)
+        class_indices_over_tasks = torch.stack(class_indices_over_tasks, dim=0)
+        print(class_indices_over_tasks)
+        _, indices = torch.min(scores_over_tasks, dim=0)
+        print("------------------")
+        print(scores_over_tasks)
+        print(class_indices_over_tasks)
+        return indices, scores_over_tasks, class_indices_over_tasks
+    
+    @torch.no_grad()
+    def choose_indices_eoe_tii(self, args, encoder, tokens, labels, batch_size):
+        encoder.eval()
+        self.base_bert.eval()
+        all_score_over_task = []
+        all_score_over_class = []
+        for e_id in range(-1, self.num_tasks + 1):
+            if e_id == -1:
+                hidden_states = self.base_bert(input_ids=tokens,
+                                        attention_mask= (tokens!=0))
+            elif e_id == 0:
+                hidden_states = encoder(tokens)
+            else:
+                encoder_out = encoder(tokens)
+                pool_ids = [e_id for x in range(len(labels))]
+                prompt_pools = [self.prompt_pools[x] for x in pool_ids]
+                hidden_states = encoder(tokens, None, encoder_out["x_encoded"], prompt_pools)
+            
+            _, scores_over_tasks, scores_over_classes = self.get_prompt_indices(args, hidden_states["x_encoded"], expert_id=e_id)
+            scores_over_tasks = scores_over_tasks.transpose(-1, -2)
+            scores_over_classes = scores_over_classes.transpose(-1, -2)
+            if e_id != -1:
+                scores_over_tasks[:, :e_id] = float('inf')  # no seen task
+                # logits = self.classifier[e_id](hidden_states)[:, :self.class_per_task]
+            # print("------------------")
+            # print(scores_over_tasks)
+            # print(scores_over_classes)
+            all_score_over_task.append(scores_over_tasks)
+            all_score_over_class.append(scores_over_classes)
+        all_score_over_task = torch.stack(all_score_over_task, dim=1)  # (batch, expert_num, task_num)
+        all_score_over_class = torch.stack(all_score_over_class, dim=1)  # (batch, expert_num, task_num)
+        
+        indices = []
+        # expert0_score_over_task = all_score_over_task[:, 0, :]  # (batch, task_num)
+        expert_values, expert_indices = torch.topk(all_score_over_task, dim=-1, k=all_score_over_task.shape[-1],
+                                                    largest=False)
+        expert_values = expert_values.tolist()
+        expert_indices = expert_indices.tolist()
+        for i in range(batch_size):
+            bert_indices = expert_indices[i][0]
+            task_indices = expert_indices[i][1]
+            if self.default_expert == "bert":
+                default_indices = copy.deepcopy(bert_indices)
+            else:
+                default_indices = copy.deepcopy(task_indices)
+            min_task = min(bert_indices[0], task_indices[0])
+            max_task = max(bert_indices[0], task_indices[0])
+            # valid_task_id = [min_task, max_task]
+            cur_min_expert = self.shift_expert_id(min_task)
+            if bert_indices[0] != task_indices[0] and cur_min_expert > 1:
+                cur_ans = []
+                for j in range(0, cur_min_expert + 1):
+                    if j <= self.max_expert:  # self.max_expert==1 --> default expert
+                        for k in expert_indices[i][j]:
+                            if k >= min_task:
+                                cur_ans.append(k)
+                                break
+                cur_count = Counter(cur_ans)
+                most_common_element = cur_count.most_common(1)
+                if most_common_element[0][1] == cur_ans.count(default_indices[0]):
+                    indices.append(default_indices[0])
+                else:
+                    indices.append(most_common_element[0][0])
+            else:
+                indices.append(default_indices[0])
+        print("hehehe")
+        print(indices)
+        return indices
+    
+    @torch.no_grad()
+    def choose_indices_wave(self, args, encoder, tokens, classifier):
+        encoder.eval()
+        encoder_out = encoder(tokens)
+
+        # prediction
+        reps = classifier(encoder_out["x_encoded"])
+        probs = F.softmax(reps, dim=1)
+        _, pred = probs.max(1)
+        return pred
 
     @torch.no_grad()
-    def evaluate_strict_model(self, args, base_model, encoder, classifier, prompted_classifier, test_data, name, task_id):
-        
-        def get_prompt_indices(self, prelogits, expert_id=0):
-            expert_id = self.shift_expert_id(expert_id)
-            task_means_over_classes = self.expert_distribution[expert_id]["class_mean"]
-            cov_inv = self.expert_distribution[expert_id]["cov_inv"]
-
-            scores_over_tasks = []
-            class_indices_over_tasks = []
-            # for each task
-            for idx, mean_over_classes in enumerate(task_means_over_classes):
-                num_labels, _ = mean_over_classes.shape
-                score_over_classes = []
-                # for each label in task
-                for c in range(num_labels):
-                    if self.query_mode == "cosine":
-                        score = - F.cosine_similarity(prelogits, mean_over_classes[c])
-                    elif self.query_mode == "euclidean":
-                        score = torch.cdist(prelogits, mean_over_classes[c].unsqueeze(0)).squeeze(1)
-                    elif self.query_mode == "mahalanobis":
-                        score = mahalanobis(prelogits, mean_over_classes[c], cov_inv, norm=2)
-                    elif self.query_mode == "maha_ft":
-                        score = mahalanobis(prelogits[idx], mean_over_classes[c], cov_inv, norm=2)
-                    else:
-                        raise NotImplementedError
-                    score_over_classes.append(score)
-                # [num_labels, n]
-                score_over_classes = torch.stack(score_over_classes)
-                score, class_indices = score_over_classes.min(dim=0)
-                # min score of labels as task score
-                scores_over_tasks.append(score)
-                class_indices_over_tasks.append(class_indices + idx * num_labels)
-            # [task_num, n]
-            scores_over_tasks = torch.stack(scores_over_tasks, dim=0)
-            class_indices_over_tasks = torch.stack(class_indices_over_tasks, dim=0)
-            _, indices = torch.min(scores_over_tasks, dim=0)
-
-            return indices, scores_over_tasks, class_indices_over_tasks
-        
-        def chose_indices(self, args, tokens, labels, batch_size):
-            all_score_over_task = []
-            all_score_over_class = []
-            all_logits = []
-            max_size = 0
-            
-            for e_id in range(-1, self.num_tasks + 1):
-                if e_id == -1:
-                    hidden_states = base_model(tokens)
-                elif e_id == 0:
-                    hidden_states = encoder(tokens)
-                else:
-                    encoder_out = encoder(tokens)
-                    prompt_pools = [self.prompt_pools[x] for x in pool_ids]
-                    hidden_states = encoder(tokens, None, encoder_out["x_encoded"], prompt_pools)
-                
-                _, scores_over_tasks, scores_over_classes = self.get_prompt_indices(hidden_states, expert_id=e_id)
-                scores_over_tasks = scores_over_tasks.transpose(-1, -2)
-                scores_over_classes = scores_over_classes.transpose(-1, -2)
-                if e_id != -1:
-                    scores_over_tasks[:, :e_id] = float('inf')  # no seen task
-                    # logits = self.classifier[e_id](hidden_states)[:, :self.class_per_task]
-                    logits = self.classifier[e_id](hidden_states)
-                    max_size = max(max_size, logits.shape[-1])
-                    all_logits.append(logits)
-                all_score_over_task.append(scores_over_tasks)
-                all_score_over_class.append(scores_over_classes)
-            all_score_over_task = torch.stack(all_score_over_task, dim=1)  # (batch, expert_num, task_num)
-            all_score_over_class = torch.stack(all_score_over_class, dim=1)  # (batch, expert_num, task_num)
-            
-            for i in range(len(all_logits)):
-                pad_size = max_size - all_logits[i].shape[-1]  # Tính số lượng padding cần thêm
-                if pad_size > 0:
-                    pad_tensor = torch.zeros(all_logits[i].shape[0], pad_size, device=all_logits[i].device)  
-                    all_logits[i] = torch.cat([all_logits[i], pad_tensor], dim=-1)  # Nối thêm padding vào logits
-
-            
-            all_logits = torch.stack(all_logits, dim=1)
-            indices = []
-            # expert0_score_over_task = all_score_over_task[:, 0, :]  # (batch, task_num)
-            expert_values, expert_indices = torch.topk(all_score_over_task, dim=-1, k=all_score_over_task.shape[-1],
-                                                       largest=False)
-            expert_values = expert_values.tolist()
-            expert_indices = expert_indices.tolist()
-            for i in range(batch_size):
-                bert_indices = expert_indices[i][0]
-                task_indices = expert_indices[i][1]
-                if self.default_expert == "bert":
-                    default_indices = copy.deepcopy(bert_indices)
-                else:
-                    default_indices = copy.deepcopy(task_indices)
-                min_task = min(bert_indices[0], task_indices[0])
-                max_task = max(bert_indices[0], task_indices[0])
-                # valid_task_id = [min_task, max_task]
-                cur_min_expert = self.shift_expert_id(min_task)
-                if bert_indices[0] != task_indices[0] and cur_min_expert > 1:
-                    cur_ans = []
-                    for j in range(0, cur_min_expert + 1):
-                        if j <= self.max_expert:  # self.max_expert==1 --> default expert
-                            for k in expert_indices[i][j]:
-                                if k >= min_task:
-                                    cur_ans.append(k)
-                                    break
-                    cur_count = Counter(cur_ans)
-                    most_common_element = cur_count.most_common(1)
-                    if most_common_element[0][1] == cur_ans.count(default_indices[0]):
-                        indices.append(default_indices[0])
-                    else:
-                        indices.append(most_common_element[0][0])
-                else:
-                    indices.append(default_indices[0])
-        
+    def evaluate_strict_model(self, args, encoder, classifier, prompted_classifier, test_data, name, task_id):      
+    
         # models evaluation mode
         encoder.eval()
         classifier.eval()
-
+        batch_size = 1
         # data loader for test set
-        data_loader = get_data_loader(args, test_data, batch_size=1, shuffle=False)
+        data_loader = get_data_loader(args, test_data, batch_size=batch_size, shuffle=False)
 
         # tqdm
         td = tqdm(data_loader, desc=name)
@@ -469,19 +500,29 @@ class Manager(object):
                 targets = labels.type(torch.LongTensor).to(args.device)
                 tokens = torch.stack([x.to(args.device) for x in tokens], dim=0)
 
-                # encoder forward
+                # encoder_out = encoder(tokens)
+                
+                pred = self.choose_indices_eoe_tii(args, encoder, tokens, labels, batch_size)
+                
+                # pred = self.choose_indices_wave(args, encoder, tokens, classifier)
                 encoder_out = encoder(tokens)
 
-                # prediction
-                reps = classifier(encoder_out["x_encoded"])
-                probs = F.softmax(reps, dim=1)
-                _, pred = probs.max(1)
+                # # encoder forward
+                # encoder_out = encoder(tokens)
+
+                # # prediction
+                # reps = classifier(encoder_out["x_encoded"])
+                # probs = F.softmax(reps, dim=1)
+                # _, pred = probs.max(1)
 
                 # accuracy_0
                 total_hits[0] += (pred == targets).float().sum().data.cpu().numpy().item()
 
                 # pool_ids
+                print("hehehehe")
+                print(pred)
                 pool_ids = [self.id2taskid[int(x)] for x in pred]
+                print(pool_ids)
                 for i, pool_id in enumerate(pool_ids):
                     total_hits[1] += pool_id == self.id2taskid[int(labels[i])]
 
@@ -556,6 +597,9 @@ class Manager(object):
         seen_data = {}
 
         for steps, (training_data, valid_data, test_data, current_relations, historic_test_data, seen_relations) in enumerate(sampler):
+            # Add thêm
+            self.num_tasks += 1
+            # Add thêm
             print("=" * 100)
             print(f"task={steps+1}")
             print(f"current relations={current_relations}")
@@ -574,6 +618,15 @@ class Manager(object):
                 rel_id = self.rel2id[relation]
                 self.id2taskid[rel_id] = steps
 
+            # Add thêm
+            self.expert_distribution.append({
+                "class_mean": [torch.zeros(args.rel_per_task, args.encoder_output_size * 2).to(args.device) for _ in
+                            range(self.num_tasks)],
+                "accumulate_cov": torch.zeros(args.encoder_output_size * 2, args.encoder_output_size * 2),
+                "cov_inv": torch.ones(args.encoder_output_size * 2, args.encoder_output_size * 2),
+            })
+            # Add thêm
+
             # train encoder
             if steps == 0:
                 self.train_encoder(args, encoder, cur_training_data, task_id=steps)
@@ -582,26 +635,31 @@ class Manager(object):
             self.prompt_pools.append(Prompt(args).to(args.device))
             self.train_prompt_pool(args, encoder, self.prompt_pools[-1], cur_training_data, task_id=steps)
 
-            # memory
-            for i, relation in enumerate(current_relations):
-                self.memorized_samples[sampler.rel2id[relation]] = self.sample_memorized_data(args, encoder, self.prompt_pools[steps], training_data[relation], f"sampling_relation_{i+1}={relation}", steps)
 
-            # replay data for classifier
-            for relation in current_relations:
-                print(f"replaying data {relation}")
-                rel_id = self.rel2id[relation]
-                replay_data = self.memorized_samples[rel_id]["replay"].sample(args.replay_epochs * args.replay_s_e_e)[0].astype("float32")
-                for e_id in range(args.replay_epochs):
-                    for x_encoded in replay_data[e_id * args.replay_s_e_e : (e_id + 1) * args.replay_s_e_e]:
-                        self.replayed_data[e_id].append({"relation": rel_id, "tokens": x_encoded})
+            # Add thêm
+            self.statistic(args, encoder, cur_training_data, steps)
+            # Add thêm
 
-            for relation in current_relations:
-                print(f"replaying key {relation}")
-                rel_id = self.rel2id[relation]
-                replay_key = self.memorized_samples[rel_id]["replay_key"].sample(args.replay_epochs * args.replay_s_e_e)[0].astype("float32")
-                for e_id in range(args.replay_epochs):
-                    for x_encoded in replay_key[e_id * args.replay_s_e_e : (e_id + 1) * args.replay_s_e_e]:
-                        self.replayed_key[e_id].append({"relation": rel_id, "tokens": x_encoded})
+            # # memory
+            # for i, relation in enumerate(current_relations):
+            #     self.memorized_samples[sampler.rel2id[relation]] = self.sample_memorized_data(args, encoder, self.prompt_pools[steps], training_data[relation], f"sampling_relation_{i+1}={relation}", steps)
+
+            # # replay data for classifier
+            # for relation in current_relations:
+            #     print(f"replaying data {relation}")
+            #     rel_id = self.rel2id[relation]
+            #     replay_data = self.memorized_samples[rel_id]["replay"].sample(args.replay_epochs * args.replay_s_e_e)[0].astype("float32")
+            #     for e_id in range(args.replay_epochs):
+            #         for x_encoded in replay_data[e_id * args.replay_s_e_e : (e_id + 1) * args.replay_s_e_e]:
+            #             self.replayed_data[e_id].append({"relation": rel_id, "tokens": x_encoded})
+
+            # for relation in current_relations:
+            #     print(f"replaying key {relation}")
+            #     rel_id = self.rel2id[relation]
+            #     replay_key = self.memorized_samples[rel_id]["replay_key"].sample(args.replay_epochs * args.replay_s_e_e)[0].astype("float32")
+            #     for e_id in range(args.replay_epochs):
+            #         for x_encoded in replay_key[e_id * args.replay_s_e_e : (e_id + 1) * args.replay_s_e_e]:
+            #             self.replayed_key[e_id].append({"relation": rel_id, "tokens": x_encoded})
 
             # all
             all_train_tasks.append(cur_training_data)
@@ -619,8 +677,8 @@ class Manager(object):
                 swag_prompted_classifier = SWAG(Classifier, no_cov_mat=not (args.cov_mat), max_num_models=args.max_num_models, args=args)
 
                 # train
-                self.train_classifier(args, classifier, swag_classifier, self.replayed_key, "train_classifier_epoch_")
-                self.train_classifier(args, prompted_classifier, swag_prompted_classifier, self.replayed_data, "train_prompted_classifier_epoch_")
+                # self.train_classifier(args, classifier, swag_classifier, self.replayed_key, "train_classifier_epoch_")
+                # self.train_classifier(args, prompted_classifier, swag_prompted_classifier, self.replayed_data, "train_prompted_classifier_epoch_")
 
                 # prediction
                 print("===NON-SWAG===")

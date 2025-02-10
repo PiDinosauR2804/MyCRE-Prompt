@@ -102,42 +102,46 @@ from transformers.models.bert.modeling_bert import BertPreTrainedModel, BertEmbe
 class BaseBert(nn.Module):
     def __init__(self, config):
         super(BaseBert, self).__init__()
-        # Lấy config mặc định của BERT
         
-        # Khởi tạo BertModel (không có bất kỳ head đặc biệt nào, chỉ thuần túy mô hình BERT)
-        self.bert = BertModel.from_pretrained(
-            "bert-base-uncased",
-            config=self.config
-        )
-        
+        # Khởi tạo BERT model
+        self.bert = BertModel.from_pretrained("bert-base-uncased", output_hidden_states=False)
         self.config = config
+        
+        # Kiểm tra pattern
         if config.pattern in ["entity_marker"]:
             self.pattern = config.pattern
-            self.encoder.resize_token_embeddings(config.vocab_size + config.marker_size)
+            self.bert.resize_token_embeddings(config.vocab_size + config.marker_size)
         else:
-            raise Exception("Wrong encoding.")
+            raise ValueError("Wrong encoding.")
 
     def forward(self, input_ids, attention_mask=None, token_type_ids=None):
-        
         out = dict()
-        e11 = (input_ids == 30522).nonzero()
-        e21 = (input_ids == 30524).nonzero()
-        
+        # Lấy đầu ra từ BERT
         out = self.bert(
             input_ids=input_ids,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
-            return_dict=True 
+            return_dict=True
         )
+
+        last_hidden_state = out["last_hidden_state"]  # Lấy output đúng key
+
+        # Lấy vị trí của entity markers [E11] (30522) và [E21] (30524)
+        e11 = (input_ids == 30522).nonzero(as_tuple=True)
+        e21 = (input_ids == 30524).nonzero(as_tuple=True)
+
         output = []
-        for i in range(e11.shape[0]):
-            instance_output = torch.index_select(out["attention_out"], 0, torch.tensor(i).cuda())
-            instance_output = torch.index_select(instance_output, 1, torch.tensor([e11[i][1], e21[i][1]]).cuda())
+        for i in range(len(e11[0])):
+            instance_output = last_hidden_state[e11[0][i], [e11[1][i], e21[1][i]]]  # Lấy embedding của hai entity markers
+            instance_output = instance_output.view(1, -1)
+            
             output.append(instance_output)
-        output = torch.cat(output, dim=0)
-        output = output.view(output.shape[0], -1)
+
+        output = torch.cat(output, dim=0)  # Ghép các tensor lại
+        # output = output.view(output.shape[0], -1)  # Reshape về dạng phù hợp
+        
         out["x_encoded"] = output
-        return out 
+        return out
 
 class CustomedBertEmbeddings(BertEmbeddings):
     def __init__(self, config):
@@ -191,10 +195,6 @@ class BaseBertEncoder(BertPreTrainedModel):
 class BertRelationEncoder(nn.Module):
     def __init__(self, config):
         super(BertRelationEncoder, self).__init__()
-        # # Add 
-        # self.base_bert = BaseBert("bert-base-uncased")
-        # self.tokenizer_for_base_bert = BaseBert.from_pretrained("bert-base-uncased")
-        # # Add 
 
         self.encoder = BaseBertEncoder.from_pretrained(config.bert_path)
         self.config = config
