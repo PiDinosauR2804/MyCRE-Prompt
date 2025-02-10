@@ -3,10 +3,14 @@ import numpy as np
 import itertools
 from torch.distributions.normal import Normal
 import copy
+from scipy.stats import multivariate_normal
+from scipy.linalg import cholesky, solve_triangular
 
-import gpytorch
-from gpytorch.lazy import RootLazyTensor, DiagLazyTensor, AddedDiagLazyTensor
-from gpytorch.distributions import MultivariateNormal
+# import gpytorch
+# from gpytorch.lazy import RootLazyTensor, DiagLazyTensor, AddedDiagLazyTensor
+# from gpytorch.distributions import MultivariateNormal
+
+
 
 from .utils import flatten, unflatten_like
 
@@ -208,27 +212,43 @@ class SWAG(torch.nn.Module):
             cov_mat_root_list.append(cov_mat_sqrt)
         return mean_list, var_list, cov_mat_root_list
 
+    # def compute_ll_for_block(self, vec, mean, var, cov_mat_root):
+    #     vec = flatten(vec)
+    #     mean = flatten(mean)
+    #     var = flatten(var)
+
+    #     cov_mat_lt = RootLazyTensor(cov_mat_root.t())
+    #     var_lt = DiagLazyTensor(var + 1e-6)
+    #     covar_lt = AddedDiagLazyTensor(var_lt, cov_mat_lt)
+    #     qdist = MultivariateNormal(mean, covar_lt)
+
+    #     with gpytorch.settings.num_trace_samples(1) and gpytorch.settings.max_cg_iterations(25):
+    #         return qdist.log_prob(vec)\
+    
+    # def block_logdet(self, var, cov_mat_root):
+    #     var = flatten(var)
+
+    #     cov_mat_lt = RootLazyTensor(cov_mat_root.t())
+    #     var_lt = DiagLazyTensor(var + 1e-6)
+    #     covar_lt = AddedDiagLazyTensor(var_lt, cov_mat_lt)
+
+    #     return covar_lt.log_det()
+    
     def compute_ll_for_block(self, vec, mean, var, cov_mat_root):
-        vec = flatten(vec)
-        mean = flatten(mean)
-        var = flatten(var)
-
-        cov_mat_lt = RootLazyTensor(cov_mat_root.t())
-        var_lt = DiagLazyTensor(var + 1e-6)
-        covar_lt = AddedDiagLazyTensor(var_lt, cov_mat_lt)
-        qdist = MultivariateNormal(mean, covar_lt)
-
-        with gpytorch.settings.num_trace_samples(1) and gpytorch.settings.max_cg_iterations(25):
-            return qdist.log_prob(vec)
-
+        vec = flatten(vec).cpu().numpy()
+        mean = flatten(mean).cpu().numpy()
+        var = flatten(var).cpu().numpy()
+        cov_mat_root = cov_mat_root.cpu().numpy()
+        
+        cov_mat = cov_mat_root @ cov_mat_root.T + np.diag(var + 1e-6)
+        log_prob = multivariate_normal.logpdf(vec, mean=mean, cov=cov_mat)
+        return torch.tensor(log_prob)
+    
     def block_logdet(self, var, cov_mat_root):
-        var = flatten(var)
-
-        cov_mat_lt = RootLazyTensor(cov_mat_root.t())
-        var_lt = DiagLazyTensor(var + 1e-6)
-        covar_lt = AddedDiagLazyTensor(var_lt, cov_mat_lt)
-
-        return covar_lt.log_det()
+        var = flatten(var).cpu().numpy()
+        cov_mat_root = cov_mat_root.cpu().numpy()
+        cov_mat = cov_mat_root @ cov_mat_root.T + np.diag(var + 1e-6)
+        return torch.tensor(np.linalg.slogdet(cov_mat)[1])
 
     def block_logll(self, param_list, mean_list, var_list, cov_mat_root_list):
         full_logprob = 0
