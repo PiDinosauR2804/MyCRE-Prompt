@@ -1,6 +1,6 @@
 from dataloaders.sampler import data_sampler
 from dataloaders.data_loader import get_data_loader
-from utils import mahalanobis
+from methods.utils import mahalanobis
 from collections import Counter
 
 
