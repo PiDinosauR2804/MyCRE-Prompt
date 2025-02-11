@@ -40,7 +40,7 @@ class Manager(object):
         self.base_bert = BaseBert(config=args).to(args.device)
         self.query_mode = "mahalanobis"
         self.max_expert = -1
-        self.waveid2eoeid = {}
+        self.eoeid2waveid = {}
         # self.tokenizer_for_base_bert = BaseBert.from_pretrained("bert-base-uncased")
         # Add thêm
 
@@ -455,7 +455,7 @@ class Manager(object):
         all_score_over_class = all_score_over_class.view(all_score_over_class.shape[0], -1)
         all_score_over_class = all_score_over_class[:, 0]
         all_score_over_class = all_score_over_class.view(-1)
-        new_all_score_over_class = [self.waveid2eoeid[iii] for iii in all_score_over_class]
+        new_all_score_over_class = [self.eoeid2waveid[iii] for iii in all_score_over_class.tolist()]
         
         return indices, new_all_score_over_class
     
@@ -497,9 +497,9 @@ class Manager(object):
 
                 # encoder_out = encoder(tokens)
                 
-                pool_ids, pred  = self.choose_indices_eoe_tii(args, encoder, tokens, labels, batch_size)
-                print(pool_ids)
-                # pool_ids, pred = self.choose_indices_wave(args, encoder, tokens, classifier)
+                # pool_ids, pred  = self.choose_indices_eoe_tii(args, encoder, tokens, labels, batch_size)
+                pool_ids, pred = self.choose_indices_wave(args, encoder, tokens, classifier)
+                
                 encoder_out = encoder(tokens)
 
                 # # encoder forward
@@ -513,7 +513,7 @@ class Manager(object):
                 # accuracy_0
                 total_hits[0] += (pred == targets).float().sum().data.cpu().numpy().item()
 
-
+                # pool_ids = [self.id2taskid[int(x)] for x in pred]
                 
                 # print(pool_ids)
                 for i, pool_id in enumerate(pool_ids):
@@ -571,7 +571,8 @@ class Manager(object):
         sampler = data_sampler(args=args, seed=args.seed)
         self.rel2id = sampler.rel2id
         self.id2rel = sampler.id2rel
-        self.waveid2eoeid = sampler.waveid2eoeid      
+        self.eoeid2waveid = sampler.eoeid2waveid  
+        print(self.eoeid2waveid)    
 
         # convert
         self.id2taskid = {}
@@ -634,26 +635,26 @@ class Manager(object):
             self.statistic(args, encoder, cur_training_data, steps)
             # Add thêm
 
-            # memory
-            for i, relation in enumerate(current_relations):
-                self.memorized_samples[sampler.rel2id[relation]] = self.sample_memorized_data(args, encoder, self.prompt_pools[steps], training_data[relation], f"sampling_relation_{i+1}={relation}", steps)
+            # # memory
+            # for i, relation in enumerate(current_relations):
+            #     self.memorized_samples[sampler.rel2id[relation]] = self.sample_memorized_data(args, encoder, self.prompt_pools[steps], training_data[relation], f"sampling_relation_{i+1}={relation}", steps)
 
-            # replay data for classifier
-            for relation in current_relations:
-                print(f"replaying data {relation}")
-                rel_id = self.rel2id[relation]
-                replay_data = self.memorized_samples[rel_id]["replay"].sample(args.replay_epochs * args.replay_s_e_e)[0].astype("float32")
-                for e_id in range(args.replay_epochs):
-                    for x_encoded in replay_data[e_id * args.replay_s_e_e : (e_id + 1) * args.replay_s_e_e]:
-                        self.replayed_data[e_id].append({"relation": rel_id, "tokens": x_encoded})
+            # # replay data for classifier
+            # for relation in current_relations:
+            #     print(f"replaying data {relation}")
+            #     rel_id = self.rel2id[relation]
+            #     replay_data = self.memorized_samples[rel_id]["replay"].sample(args.replay_epochs * args.replay_s_e_e)[0].astype("float32")
+            #     for e_id in range(args.replay_epochs):
+            #         for x_encoded in replay_data[e_id * args.replay_s_e_e : (e_id + 1) * args.replay_s_e_e]:
+            #             self.replayed_data[e_id].append({"relation": rel_id, "tokens": x_encoded})
 
-            for relation in current_relations:
-                print(f"replaying key {relation}")
-                rel_id = self.rel2id[relation]
-                replay_key = self.memorized_samples[rel_id]["replay_key"].sample(args.replay_epochs * args.replay_s_e_e)[0].astype("float32")
-                for e_id in range(args.replay_epochs):
-                    for x_encoded in replay_key[e_id * args.replay_s_e_e : (e_id + 1) * args.replay_s_e_e]:
-                        self.replayed_key[e_id].append({"relation": rel_id, "tokens": x_encoded})
+            # for relation in current_relations:
+            #     print(f"replaying key {relation}")
+            #     rel_id = self.rel2id[relation]
+            #     replay_key = self.memorized_samples[rel_id]["replay_key"].sample(args.replay_epochs * args.replay_s_e_e)[0].astype("float32")
+            #     for e_id in range(args.replay_epochs):
+            #         for x_encoded in replay_key[e_id * args.replay_s_e_e : (e_id + 1) * args.replay_s_e_e]:
+            #             self.replayed_key[e_id].append({"relation": rel_id, "tokens": x_encoded})
 
             # all
             all_train_tasks.append(cur_training_data)
@@ -671,8 +672,8 @@ class Manager(object):
                 swag_prompted_classifier = SWAG(Classifier, no_cov_mat=not (args.cov_mat), max_num_models=args.max_num_models, args=args)
 
                 # train
-                self.train_classifier(args, classifier, swag_classifier, self.replayed_key, "train_classifier_epoch_")
-                self.train_classifier(args, prompted_classifier, swag_prompted_classifier, self.replayed_data, "train_prompted_classifier_epoch_")
+                # self.train_classifier(args, classifier, swag_classifier, self.replayed_key, "train_classifier_epoch_")
+                # self.train_classifier(args, prompted_classifier, swag_prompted_classifier, self.replayed_data, "train_prompted_classifier_epoch_")
 
                 # prediction
                 print("===NON-SWAG===")

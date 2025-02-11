@@ -43,8 +43,8 @@ class data_sampler(object):
         self.shuffle_index = np.argsort(self.shuffle_index)
         
         # Add theem
-        self.waveid2eoeid = {}      
-        self.waveid2eoeid = {shuffled_idx: sorted_idx for sorted_idx, shuffled_idx in enumerate(self.shuffle_index)}
+        self.eoeid2waveid = {}      
+        self.eoeid2waveid = {sorted_idx : shuffled_idx for sorted_idx, shuffled_idx in enumerate(self.shuffle_index)}
         # Add theem
 
         # regenerate data
@@ -82,7 +82,7 @@ class data_sampler(object):
         self.shuffle_index = list(range(len(self.id2rel)))
         random.shuffle(self.shuffle_index)
         self.shuffle_index = np.argsort(self.shuffle_index)
-        # self.waveid2eoeid = {shuffled_idx: sorted_idx for sorted_idx, shuffled_idx in enumerate(self.shuffled_index)}
+        # self.eoeid2waveid = {shuffled_idx: sorted_idx for sorted_idx, shuffled_idx in enumerate(self.shuffled_index)}
 
 
     def __iter__(self):
