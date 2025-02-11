@@ -39,6 +39,8 @@ class Manager(object):
         self.num_tasks = -1
         self.base_bert = BaseBert(config=args).to(args.device)
         self.query_mode = "mahalanobis"
+        self.max_expert = -1
+        self.waveid2eoeid = {}
         # self.tokenizer_for_base_bert = BaseBert.from_pretrained("bert-base-uncased")
         # Add thêm
 
@@ -349,9 +351,6 @@ class Manager(object):
         expert_id = expert_id + 1
         task_means_over_classes = self.expert_distribution[expert_id]["class_mean"]
         cov_inv = self.expert_distribution[expert_id]["cov_inv"]
-        # print("-----------------")
-        # print(task_means_over_classes)
-        # print(cov_inv)
 
         scores_over_tasks = []
         class_indices_over_tasks = []
@@ -366,34 +365,24 @@ class Manager(object):
                 elif self.query_mode == "euclidean":
                     score = torch.cdist(prelogits, mean_over_classes[c].unsqueeze(0)).squeeze(1)
                 elif self.query_mode == "mahalanobis":
-                    # print("pêppeee")
-                    # print(prelogits.shape)
-                    # print(mean_over_classes[c].shape)
-                    # print(cov_inv.shape)
                     score = mahalanobis(prelogits, mean_over_classes[c], cov_inv, norm=2)
-                    print(score)
                 elif self.query_mode == "maha_ft":
                     score = mahalanobis(prelogits[idx], mean_over_classes[c], cov_inv, norm=2)
                 else:
                     print("erorrrrrrrrr")
                     raise NotImplementedError
                 score_over_classes.append(score)
-                print(score)
             # [num_labels, n]
             score_over_classes = torch.stack(score_over_classes)
             score, class_indices = score_over_classes.min(dim=0)
             # min score of labels as task score
             scores_over_tasks.append(score)
-            # class_indices_over_tasks.append(class_indices + idx * num_labels)
-            class_indices_over_tasks.append(class_indices)
+            class_indices_over_tasks.append(class_indices + idx * num_labels)
+            # class_indices_over_tasks.append(class_indices)
         # [task_num, n]
         scores_over_tasks = torch.stack(scores_over_tasks, dim=0)
         class_indices_over_tasks = torch.stack(class_indices_over_tasks, dim=0)
-        print(class_indices_over_tasks)
         _, indices = torch.min(scores_over_tasks, dim=0)
-        print("------------------")
-        print(scores_over_tasks)
-        print(class_indices_over_tasks)
         return indices, scores_over_tasks, class_indices_over_tasks
     
     @torch.no_grad()
@@ -420,9 +409,6 @@ class Manager(object):
             if e_id != -1:
                 scores_over_tasks[:, :e_id] = float('inf')  # no seen task
                 # logits = self.classifier[e_id](hidden_states)[:, :self.class_per_task]
-            # print("------------------")
-            # print(scores_over_tasks)
-            # print(scores_over_classes)
             all_score_over_task.append(scores_over_tasks)
             all_score_over_class.append(scores_over_classes)
         all_score_over_task = torch.stack(all_score_over_task, dim=1)  # (batch, expert_num, task_num)
@@ -437,14 +423,18 @@ class Manager(object):
         for i in range(batch_size):
             bert_indices = expert_indices[i][0]
             task_indices = expert_indices[i][1]
-            if self.default_expert == "bert":
-                default_indices = copy.deepcopy(bert_indices)
-            else:
-                default_indices = copy.deepcopy(task_indices)
+            
+            # if self.default_expert == "bert":
+            #     default_indices = copy.deepcopy(bert_indices)
+            # else:
+            #     default_indices = copy.deepcopy(task_indices)
+            
+            default_indices = copy.deepcopy(task_indices)
+            
             min_task = min(bert_indices[0], task_indices[0])
             max_task = max(bert_indices[0], task_indices[0])
             # valid_task_id = [min_task, max_task]
-            cur_min_expert = self.shift_expert_id(min_task)
+            cur_min_expert = min_task + 1
             if bert_indices[0] != task_indices[0] and cur_min_expert > 1:
                 cur_ans = []
                 for j in range(0, cur_min_expert + 1):
@@ -461,9 +451,13 @@ class Manager(object):
                     indices.append(most_common_element[0][0])
             else:
                 indices.append(default_indices[0])
-        print("hehehe")
-        print(indices)
-        return indices
+        
+        all_score_over_class = all_score_over_class.view(all_score_over_class.shape[0], -1)
+        all_score_over_class = all_score_over_class[:, 0]
+        all_score_over_class = all_score_over_class.view(-1)
+        new_all_score_over_class = [self.waveid2eoeid[iii] for iii in all_score_over_class]
+        
+        return indices, new_all_score_over_class
     
     @torch.no_grad()
     def choose_indices_wave(self, args, encoder, tokens, classifier):
@@ -474,7 +468,8 @@ class Manager(object):
         reps = classifier(encoder_out["x_encoded"])
         probs = F.softmax(reps, dim=1)
         _, pred = probs.max(1)
-        return pred
+        pool_ids = [self.id2taskid[int(x)] for x in pred]
+        return pool_ids, pred
 
     @torch.no_grad()
     def evaluate_strict_model(self, args, encoder, classifier, prompted_classifier, test_data, name, task_id):      
@@ -502,9 +497,9 @@ class Manager(object):
 
                 # encoder_out = encoder(tokens)
                 
-                pred = self.choose_indices_eoe_tii(args, encoder, tokens, labels, batch_size)
-                
-                # pred = self.choose_indices_wave(args, encoder, tokens, classifier)
+                pool_ids, pred  = self.choose_indices_eoe_tii(args, encoder, tokens, labels, batch_size)
+                print(pool_ids)
+                # pool_ids, pred = self.choose_indices_wave(args, encoder, tokens, classifier)
                 encoder_out = encoder(tokens)
 
                 # # encoder forward
@@ -518,11 +513,9 @@ class Manager(object):
                 # accuracy_0
                 total_hits[0] += (pred == targets).float().sum().data.cpu().numpy().item()
 
-                # pool_ids
-                print("hehehehe")
-                print(pred)
-                pool_ids = [self.id2taskid[int(x)] for x in pred]
-                print(pool_ids)
+
+                
+                # print(pool_ids)
                 for i, pool_id in enumerate(pool_ids):
                     total_hits[1] += pool_id == self.id2taskid[int(labels[i])]
 
@@ -578,6 +571,7 @@ class Manager(object):
         sampler = data_sampler(args=args, seed=args.seed)
         self.rel2id = sampler.rel2id
         self.id2rel = sampler.id2rel
+        self.waveid2eoeid = sampler.waveid2eoeid      
 
         # convert
         self.id2taskid = {}
@@ -640,26 +634,26 @@ class Manager(object):
             self.statistic(args, encoder, cur_training_data, steps)
             # Add thêm
 
-            # # memory
-            # for i, relation in enumerate(current_relations):
-            #     self.memorized_samples[sampler.rel2id[relation]] = self.sample_memorized_data(args, encoder, self.prompt_pools[steps], training_data[relation], f"sampling_relation_{i+1}={relation}", steps)
+            # memory
+            for i, relation in enumerate(current_relations):
+                self.memorized_samples[sampler.rel2id[relation]] = self.sample_memorized_data(args, encoder, self.prompt_pools[steps], training_data[relation], f"sampling_relation_{i+1}={relation}", steps)
 
-            # # replay data for classifier
-            # for relation in current_relations:
-            #     print(f"replaying data {relation}")
-            #     rel_id = self.rel2id[relation]
-            #     replay_data = self.memorized_samples[rel_id]["replay"].sample(args.replay_epochs * args.replay_s_e_e)[0].astype("float32")
-            #     for e_id in range(args.replay_epochs):
-            #         for x_encoded in replay_data[e_id * args.replay_s_e_e : (e_id + 1) * args.replay_s_e_e]:
-            #             self.replayed_data[e_id].append({"relation": rel_id, "tokens": x_encoded})
+            # replay data for classifier
+            for relation in current_relations:
+                print(f"replaying data {relation}")
+                rel_id = self.rel2id[relation]
+                replay_data = self.memorized_samples[rel_id]["replay"].sample(args.replay_epochs * args.replay_s_e_e)[0].astype("float32")
+                for e_id in range(args.replay_epochs):
+                    for x_encoded in replay_data[e_id * args.replay_s_e_e : (e_id + 1) * args.replay_s_e_e]:
+                        self.replayed_data[e_id].append({"relation": rel_id, "tokens": x_encoded})
 
-            # for relation in current_relations:
-            #     print(f"replaying key {relation}")
-            #     rel_id = self.rel2id[relation]
-            #     replay_key = self.memorized_samples[rel_id]["replay_key"].sample(args.replay_epochs * args.replay_s_e_e)[0].astype("float32")
-            #     for e_id in range(args.replay_epochs):
-            #         for x_encoded in replay_key[e_id * args.replay_s_e_e : (e_id + 1) * args.replay_s_e_e]:
-            #             self.replayed_key[e_id].append({"relation": rel_id, "tokens": x_encoded})
+            for relation in current_relations:
+                print(f"replaying key {relation}")
+                rel_id = self.rel2id[relation]
+                replay_key = self.memorized_samples[rel_id]["replay_key"].sample(args.replay_epochs * args.replay_s_e_e)[0].astype("float32")
+                for e_id in range(args.replay_epochs):
+                    for x_encoded in replay_key[e_id * args.replay_s_e_e : (e_id + 1) * args.replay_s_e_e]:
+                        self.replayed_key[e_id].append({"relation": rel_id, "tokens": x_encoded})
 
             # all
             all_train_tasks.append(cur_training_data)
@@ -677,8 +671,8 @@ class Manager(object):
                 swag_prompted_classifier = SWAG(Classifier, no_cov_mat=not (args.cov_mat), max_num_models=args.max_num_models, args=args)
 
                 # train
-                # self.train_classifier(args, classifier, swag_classifier, self.replayed_key, "train_classifier_epoch_")
-                # self.train_classifier(args, prompted_classifier, swag_prompted_classifier, self.replayed_data, "train_prompted_classifier_epoch_")
+                self.train_classifier(args, classifier, swag_classifier, self.replayed_key, "train_classifier_epoch_")
+                self.train_classifier(args, prompted_classifier, swag_prompted_classifier, self.replayed_data, "train_prompted_classifier_epoch_")
 
                 # prediction
                 print("===NON-SWAG===")
